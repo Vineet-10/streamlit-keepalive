@@ -1,0 +1,110 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# streamlit-keepalive / .github/workflows/keepalive.yml
+#
+# PURPOSE
+#   Visit each Streamlit app on a schedule and click "wake up" if sleeping.
+#
+# WHY EVERY 6 HOURS?
+#   As of March 2025, Streamlit Community Cloud sleeps apps after only 12 hours
+#   of inactivity (reduced from 24h). Every 6 hours gives a 2× safety margin.
+#
+# SETUP REQUIRED  (do this ONCE in your repo)
+#   1. Go to Settings → Secrets and variables → Actions → New repository secret
+#   2. Name:  STREAMLIT_URLS
+#      Value: https://yourapp.streamlit.app
+#      (multiple apps: separate with commas, no spaces)
+#
+# AVOIDING GITHUB AUTO-DISABLING THIS WORKFLOW
+#   GitHub disables scheduled workflows if a repo has zero activity for 60 days.
+#   The "bump-repo" job below prevents this by committing a tiny timestamp file
+#   once per week. No code is changed — it only touches last_keepalive_run.txt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Streamlit Keepalive
+
+on:
+  schedule:
+    #        ┌───── minute (0)
+    #        │  ┌── hour (every 6th: 0, 6, 12, 18 UTC)
+    #        │  │    ┌─ day-of-month (*)
+    #        │  │    │  ┌─ month (*)
+    #        │  │    │  │  ┌─ day-of-week (*)
+    - cron: "0 */6 * * *"
+
+  # Allow one-click manual test from the GitHub Actions tab
+  workflow_dispatch:
+
+jobs:
+  # ── Main job: wake the Streamlit apps ──────────────────────────────────────
+  keepalive:
+    name: Wake Streamlit apps
+    runs-on: ubuntu-latest
+    timeout-minutes: 20       # Kill the job if it hangs (saves free minutes)
+
+    steps:
+      # 1. Check out the repo so wake.py and requirements.txt are available
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python with pip caching (speeds up subsequent runs)
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # 3. Install Python dependencies
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Install Chromium and its system-level dependencies
+      #    playwright install-deps is crucial — without it Chromium crashes
+      #    silently on Ubuntu runners (missing shared libs).
+      - name: Install Playwright + Chromium
+        run: |
+          playwright install chromium
+          playwright install-deps chromium
+
+      # 5. Run the keepalive script
+      #    STREAMLIT_URLS is read from GitHub Secrets — never hardcode URLs here.
+      - name: Run keepalive script
+        env:
+          STREAMLIT_URLS: ${{ secrets.STREAMLIT_URLS }}
+        run: python wake.py
+
+      # 6. Upload screenshots no matter what (even on failure)
+      #    Inspect these in Actions → your run → Artifacts to debug issues.
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-run-${{ github.run_number }}
+          path: screenshots/
+          retention-days: 7          # Auto-delete after a week
+          if-no-files-found: ignore  # Don't fail if no screenshots were taken
+
+  # ── Weekly repo bump to prevent GitHub disabling our schedule ──────────────
+  bump-repo:
+    name: Keep repo active (weekly bump)
+    runs-on: ubuntu-latest
+    # Only run on Sundays at 00:00 UTC (the cron above fires at 00:00 every day,
+    # so this fires once on Sunday)
+    if: github.event_name == 'schedule' && startsWith(github.event.schedule, '0 0')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Use a token that can push back to the repo
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write last-run timestamp
+        run: |
+          echo "Last successful keepalive: $(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            > last_keepalive_run.txt
+
+      - name: Commit timestamp file
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: keepalive weekly bump [skip ci]"
+          file_pattern: last_keepalive_run.txt
