@@ -5,14 +5,19 @@ Visits one or more Streamlit Community Cloud apps and wakes them
 if they have entered hibernation mode.
 
 KNOWN FAILURE MODES HANDLED:
-  1. App takes >30s to load         → generous timeouts + wait_for_load_state
-  2. Sleep button text changes       → multiple selector fallbacks
-  3. Chromium crashes in CI          → --no-sandbox + --disable-dev-shm-usage flags
-  4. Flaky network / transient 5xx   → 3-attempt retry with exponential backoff
-  5. Page is still "loading" (spinner) vs "sleeping" (button) → separate detection
-  6. No URLs provided                → fail fast with clear error
-  7. One URL fails, others shouldn't → per-URL isolation + summary at end
-  8. Silent failures in CI           → screenshots uploaded as artifacts every run
+  1. App takes >30s to load          → generous timeouts + wait_for_load_state
+  2. Sleep button text changes        → multiple selector fallbacks
+  3. Chromium crashes in CI           → --no-sandbox + --disable-dev-shm-usage
+  4. Flaky network / transient 5xx    → 3-attempt retry with exponential backoff
+  5. Spinner vs sleep-screen          → separate page-text detection
+  6. No URLs provided                 → fail fast with clear error
+  7. One URL crashes the browser      → fresh browser launched per URL (isolated)
+  8. Silent failures in CI            → screenshots uploaded as artifacts every run
+
+ARCHITECTURE NOTE:
+  A fresh Chromium browser is launched for each URL. This prevents the
+  TargetClosedError that occurs when --single-process mode destabilises
+  the shared browser process after the first context closes.
 
 IMPORTANT (as of March 2025):
   - Streamlit Community Cloud now sleeps apps after ONLY 12 hours of inactivity
@@ -262,26 +267,49 @@ def main() -> None:
 
     results: dict[str, bool] = {}
 
+    # Chromium flags that are safe and required for GitHub Actions CI runners.
+    #
+    # REMOVED vs original version:
+    #   --single-process  → ROOT CAUSE of the TargetClosedError crash.
+    #                       In single-process mode all contexts share one OS
+    #                       process. When the first context closes it can
+    #                       destabilise that process and kill the browser,
+    #                       causing TargetClosedError on the second URL.
+    #   --no-zygote       → companion flag to --single-process; also unstable.
+    #
+    # KEPT (still required in GH Actions):
+    #   --no-sandbox / --disable-setuid-sandbox  → GH runners have no user ns
+    #   --disable-dev-shm-usage                  → /dev/shm is only 64MB on
+    #                                              GH runners; without this
+    #                                              Chromium crashes on large DOM
+    CHROMIUM_ARGS = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--disable-gpu",
+        "--disable-extensions",
+        "--no-first-run",
+    ]
+
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",               # Required in GitHub Actions (no root ns)
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",    # /dev/shm is tiny in many CI envs
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",               # Avoids zombie child processes
-                "--disable-gpu",
-                "--disable-extensions",
-                "--single-process",          # Safer inside Docker/CI containers
-            ],
-        )
-
+        # Launch a FRESH browser for every URL.
+        #
+        # Why not one shared browser? Because if one URL's page somehow
+        # crashes the browser process, a shared browser would take down
+        # every subsequent URL in the same run. A browser-per-URL means
+        # complete isolation: one bad URL cannot affect any other.
+        # The overhead is ~3 extra seconds per URL — worth it.
         for url in urls:
-            results[url] = process_url(browser, url)
-
-        browser.close()
+            browser = pw.chromium.launch(headless=True, args=CHROMIUM_ARGS)
+            try:
+                results[url] = process_url(browser, url)
+            finally:
+                # Always close, even if process_url raised unexpectedly
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
     # ── Final summary ─────────────────────────────────────────────────────────
     logger.info(f"\n{'='*60}")
