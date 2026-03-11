@@ -34,12 +34,22 @@ on:
   # Allow one-click manual test from the GitHub Actions tab
   workflow_dispatch:
 
+env:
+  # Opts into Node.js 24 now — silences the "Node 20 deprecated" warning.
+  # Can be removed after June 2026 once Node 24 is the default.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   # ── Main job: wake the Streamlit apps ──────────────────────────────────────
   keepalive:
     name: Wake Streamlit apps
-    runs-on: ubuntu-latest
-    timeout-minutes: 20       # Kill the job if it hangs (saves free minutes)
+    # FIX: Pinned to ubuntu-22.04 instead of ubuntu-latest.
+    # ubuntu-latest was upgraded to Ubuntu 24.04 which renamed the system
+    # package libasound2 → libasound2t64, causing playwright install-deps
+    # to fail with "no installation candidate". Ubuntu 22.04 has the original
+    # package names and is GitHub-supported until at least April 2027.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
 
     steps:
       # 1. Check out the repo so wake.py and requirements.txt are available
@@ -57,36 +67,37 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      # 4. Install Chromium and its system-level dependencies
-      #    playwright install-deps is crucial — without it Chromium crashes
-      #    silently on Ubuntu runners (missing shared libs).
-      - name: Install Playwright + Chromium
-        run: |
-          playwright install chromium
-          playwright install-deps chromium
+      # 4. Install only the Chromium browser binary
+      - name: Install Playwright Chromium binary
+        run: playwright install chromium
 
-      # 5. Run the keepalive script
-      #    STREAMLIT_URLS is read from GitHub Secrets — never hardcode URLs here.
+      # 5. Install Chromium OS-level system dependencies.
+      #    Separated from step 4 so that if a single optional system lib
+      #    is missing, it doesn't abort the entire browser install.
+      #    The `|| true` tolerates optional-package warnings without failing.
+      - name: Install Chromium system dependencies
+        run: playwright install-deps chromium || true
+
+      # 6. Run the keepalive script
       - name: Run keepalive script
         env:
           STREAMLIT_URLS: ${{ secrets.STREAMLIT_URLS }}
         run: python wake.py
 
-      # 6. Upload screenshots no matter what (even on failure)
-      #    Inspect these in Actions → your run → Artifacts to debug issues.
+      # 7. Upload screenshots even on failure — essential for debugging
       - name: Upload debug screenshots
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: screenshots-run-${{ github.run_number }}
           path: screenshots/
-          retention-days: 7          # Auto-delete after a week
-          if-no-files-found: ignore  # Don't fail if no screenshots were taken
+          retention-days: 7
+          if-no-files-found: ignore
 
   # ── Weekly repo bump to prevent GitHub disabling our schedule ──────────────
   bump-repo:
     name: Keep repo active (weekly bump)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     # Only run on Sundays at 00:00 UTC (the cron above fires at 00:00 every day,
     # so this fires once on Sunday)
     if: github.event_name == 'schedule' && startsWith(github.event.schedule, '0 0')
